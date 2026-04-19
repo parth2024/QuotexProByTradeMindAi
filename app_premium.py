@@ -1,6 +1,6 @@
 """
 PREMIUM SIGNAL GENERATOR - RENDER DEPLOYMENT
-With proxy rotation to bypass Quotex datacenter IP block
+Proxy via environment variable — websockets picks it up automatically
 """
 
 from flask import Flask, render_template, request, jsonify, session
@@ -8,7 +8,6 @@ from flask_cors import CORS
 import secrets
 import time
 import os
-import json
 import traceback
 import asyncio
 from market_analyzer import MarketAnalyzer
@@ -39,20 +38,21 @@ if QUOTEX_SESSION:
     print("Session file written from environment variable")
 
 # ─────────────────────────────────────────────────────────────
-# PROXY LIST — all 10 Webshare proxies with auto-rotation
-# Format: (host, port, username, password)
+# PROXY LIST
+# websockets library reads HTTPS_PROXY / WSS_PROXY env vars
+# automatically — no code change needed in pyquotex
 # ─────────────────────────────────────────────────────────────
 PROXIES = [
-    ("31.59.20.176",      6754, "gixtiejj", "x7n4hi71ksvo"),
-    ("198.23.239.134",    6540, "gixtiejj", "x7n4hi71ksvo"),
-    ("45.38.107.97",      6014, "gixtiejj", "x7n4hi71ksvo"),
-    ("107.172.163.27",    6543, "gixtiejj", "x7n4hi71ksvo"),
-    ("198.105.121.200",   6462, "gixtiejj", "x7n4hi71ksvo"),
-    ("216.10.27.159",     6837, "gixtiejj", "x7n4hi71ksvo"),
-    ("142.111.67.146",    5611, "gixtiejj", "x7n4hi71ksvo"),
-    ("191.96.254.138",    6185, "gixtiejj", "x7n4hi71ksvo"),
-    ("31.58.9.4",         6077, "gixtiejj", "x7n4hi71ksvo"),
-    ("23.26.71.145",      5628, "gixtiejj", "x7n4hi71ksvo"),
+    "http://gixtiejj:x7n4hi71ksvo@31.59.20.176:6754",
+    "http://gixtiejj:x7n4hi71ksvo@198.23.239.134:6540",
+    "http://gixtiejj:x7n4hi71ksvo@45.38.107.97:6014",
+    "http://gixtiejj:x7n4hi71ksvo@107.172.163.27:6543",
+    "http://gixtiejj:x7n4hi71ksvo@198.105.121.200:6462",
+    "http://gixtiejj:x7n4hi71ksvo@216.10.27.159:6837",
+    "http://gixtiejj:x7n4hi71ksvo@142.111.67.146:5611",
+    "http://gixtiejj:x7n4hi71ksvo@191.96.254.138:6185",
+    "http://gixtiejj:x7n4hi71ksvo@31.58.9.4:6077",
+    "http://gixtiejj:x7n4hi71ksvo@23.26.71.145:5628",
 ]
 
 # Global state
@@ -64,13 +64,12 @@ last_cache_time = 0
 
 
 def run_async(coro):
-    """Run async coroutine from sync gunicorn worker"""
     try:
         loop = asyncio.get_event_loop()
         if loop.is_running():
             import concurrent.futures
             with concurrent.futures.ThreadPoolExecutor() as pool:
-                return pool.submit(asyncio.run, coro).result(timeout=60)
+                return pool.submit(asyncio.run, coro).result(timeout=120)
         return loop.run_until_complete(coro)
     except RuntimeError:
         return asyncio.run(coro)
@@ -118,48 +117,56 @@ def admin_login():
     if not email or not password:
         return jsonify({"success": False, "message": "Email and password required"})
 
-    async def try_connect_with_proxy(host, port, user, pwd):
-        """Attempt connection through a single proxy"""
+    async def try_proxy(proxy_url):
+        """Set proxy env vars, attempt connection, return (client, message)"""
         try:
-            proxy_url = f"http://{user}:{pwd}@{host}:{port}"
-            print(f"Trying proxy {host}:{port}...")
+            # websockets library reads these env vars automatically
+            os.environ['HTTPS_PROXY'] = proxy_url
+            os.environ['WSS_PROXY']   = proxy_url
+            os.environ['HTTP_PROXY']  = proxy_url
 
             client = Quotex(
                 email=email,
                 password=password,
                 lang="en",
-                root_path=ROOT_PATH,
-                proxy=proxy_url
+                root_path=ROOT_PATH
             )
             check, reason = await client.connect()
+
             if check:
                 return client, "Connected"
             else:
-                print(f"  Proxy {host}:{port} failed: {reason}")
                 return None, str(reason)
+
         except Exception as e:
-            print(f"  Proxy {host}:{port} exception: {e}")
             return None, str(e)
+        finally:
+            # Always clean up env vars after attempt
+            os.environ.pop('HTTPS_PROXY', None)
+            os.environ.pop('WSS_PROXY',   None)
+            os.environ.pop('HTTP_PROXY',  None)
 
     async def do_connect():
         global quotex_client, analyzer, is_connected
 
         last_error = "All proxies failed"
 
-        for (host, port, user, pwd) in PROXIES:
-            client, message = await try_connect_with_proxy(host, port, user, pwd)
+        for proxy_url in PROXIES:
+            host = proxy_url.split('@')[1]
+            print(f"Trying proxy {host}...")
+            client, message = await try_proxy(proxy_url)
             if client:
                 quotex_client = client
                 analyzer      = MarketAnalyzer(quotex_client)
                 is_connected  = True
-                print(f"Connected via proxy {host}:{port}")
-                return True, f"Connected via {host}"
+                print(f"✅ Connected via {host}")
+                return True, f"Connected via proxy"
+            print(f"  Failed: {message}")
             last_error = message
-            # Small delay before trying next proxy
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.5)
 
-        # Last resort: try without proxy
-        print("All proxies failed, trying direct connection...")
+        # Final attempt: no proxy
+        print("All proxies failed — trying direct...")
         try:
             client = Quotex(
                 email=email,
@@ -172,13 +179,12 @@ def admin_login():
                 quotex_client = client
                 analyzer      = MarketAnalyzer(quotex_client)
                 is_connected  = True
-                print("Connected directly (no proxy)")
+                print("Connected directly")
                 return True, "Connected"
             last_error = str(reason)
         except Exception as e:
             last_error = str(e)
 
-        print(f"All connection attempts failed. Last error: {last_error}")
         return False, last_error
 
     try:
